@@ -73,7 +73,7 @@ looking for a specific service, use the table of contents:
 ## Repository layout
 ## Architecture
 
-![[cloudCart.drawio.png]]
+![CloudCart architecture](cloudCart.drawio.png)
 
 The full design. Traffic enters through the internet-facing ALB, which spreads
 requests across two EC2 instances in private subnets. Both instances mount a
