@@ -1,0 +1,722 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudCart Online Store - Cloud Practitioner Capstone.
+  VPC across 2 AZs (10.20.0.0/24), public ALB + Auto Scaling Group serving a
+  PHP product-catalog page from EC2 (Ubuntu 26.04) backed by RDS MySQL and
+  shared EFS, an S3 bucket for uploads that triggers a VPC-attached Lambda
+  which records the upload in RDS and publishes to SNS. Cognito User Pool
+  provides JWT-based auth with admin/customer groups; the PHP app ships as
+  an S3 bundle and is released onto EFS via an atomic symlink flip.
+
+# -----------------------------------------------------------------------------
+Parameters:
+# -----------------------------------------------------------------------------
+
+  LatestUbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/resolute/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 26.04 LTS AMI, resolved via the public Canonical SSM parameter.
+
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    Description: Master username for the RDS MySQL instance.
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: "^[a-zA-Z0-9!#$%^&*()_+=-]+$"
+    ConstraintDescription: 8-41 characters, no '/', '@', '"', or spaces.
+    Description: Master password for the RDS MySQL instance.
+
+  NotificationEmail:
+    Type: String
+    Description: Email address subscribed to the upload-notification SNS topic.
+
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket (created by deploy.sh) holding the zipped Lambda code and PHP app.
+
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key of the zipped Lambda code inside ArtifactBucket.
+
+  AppCodeKey:
+    Type: String
+    Description: S3 key of the zipped PHP app inside ArtifactBucket.
+
+  ReleaseId:
+    Type: String
+    Default: "v1"
+    Description: Release identifier naming the app release directory on EFS.
+
+  ASGTargetCpuUtilization:
+    Type: Number
+    Default: 50
+    Description: Target average CPU utilization (%) for the ASG target-tracking policy.
+
+# -----------------------------------------------------------------------------
+Resources:
+# -----------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: CloudCart-VPC}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.0/27
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: Public-A}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.32/27
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: Public-B}
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.64/27
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: Private-App-A}
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.96/27
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: Private-App-B}
+
+  PrivateDataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.128/27
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: Private-Data-A}
+
+  PrivateDataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.0.160/27
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: Private-Data-B}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: CloudCart-IGW}
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      AllocationId: !GetAtt NatEIP.AllocationId
+      Tags:
+        - {Key: Name, Value: CloudCart-NAT}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: CloudCart-RT-Public}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: CloudCart-RT-Private}
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateAppARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateAppBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateDataARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateDataBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      SecurityGroupEgress:
+        - {IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: alb-sg}
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 app instances - allow HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: ec2-lab-sg}
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS mount targets - allow NFS from EC2 only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref EC2SecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: efs-sg}
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda ENIs - outbound only
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - {IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: lambda-sg}
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL - allow 3306 from EC2 and Lambda only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref EC2SecurityGroup}
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref LambdaSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: Name, Value: rds-mysql-sg}
+
+  # ---------------------------------------------------------------------------
+  # Cognito (JWT-only; no Hosted UI, no callback URLs)
+  # ---------------------------------------------------------------------------
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cloudcart-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: cloudcart-web
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref UserPool
+      Precedence: 1
+
+  CustomerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: customer
+      UserPoolId: !Ref UserPool
+      Precedence: 10
+
+  # ---------------------------------------------------------------------------
+  # S3 uploads bucket + Lambda trigger
+  # ---------------------------------------------------------------------------
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub cloudcart-uploads-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt RecordWriterFunction.Arn
+
+  UploadsBucketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RecordWriterFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::cloudcart-uploads-${AWS::AccountId}-${AWS::Region}
+      SourceAccount: !Ref "AWS::AccountId"
+
+  # ---------------------------------------------------------------------------
+  # EFS
+  # ---------------------------------------------------------------------------
+
+  AppFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    Properties:
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      Encrypted: true
+      FileSystemTags:
+        - {Key: Name, Value: CloudCart-EFS}
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref AppFileSystem
+      SubnetId: !Ref PrivateAppSubnetA
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref AppFileSystem
+      SubnetId: !Ref PrivateAppSubnetB
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  # ---------------------------------------------------------------------------
+  # RDS
+  # ---------------------------------------------------------------------------
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: CloudCart DB subnet group spanning both AZs
+      SubnetIds:
+        - !Ref PrivateDataSubnetA
+        - !Ref PrivateDataSubnetB
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      StorageType: gp2
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBName: cloudcart
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref RDSSecurityGroup]
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # ---------------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------------
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AppCodeRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/app/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: CloudCartLambdaLeastPrivilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::cloudcart-uploads-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref UploadNotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # ALB
+  # ---------------------------------------------------------------------------
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: stickiness.enabled, Value: "true"}
+        - {Key: stickiness.type, Value: lb_cookie}
+        - {Key: stickiness.lb_cookie.duration_seconds, Value: "3600"}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  # ---------------------------------------------------------------------------
+  # Launch Template + ASG
+  # ---------------------------------------------------------------------------
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestUbuntuAmiId
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds: [!Ref EC2SecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            exec > /var/log/user-data.log 2>&1
+
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y apache2 php libapache2-mod-php php-mysql php-curl \
+                               nfs-common mysql-client unzip awscli
+
+            # --- Mount EFS at /mnt/efs ---
+            EFS_ID="${AppFileSystem}"
+            EFS_DNS="${!EFS_ID}.efs.${AWS::Region}.amazonaws.com"
+            mkdir -p /mnt/efs
+            for i in $(seq 1 10); do
+              if mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 "$EFS_DNS:/" /mnt/efs; then
+                break
+              fi
+              echo "EFS mount attempt $i failed, retrying in 15s..."
+              sleep 15
+            done
+            grep -q "$EFS_DNS" /etc/fstab || echo "$EFS_DNS:/ /mnt/efs nfs4 nfsvers=4.1,_netdev 0 0" >> /etc/fstab
+
+            # --- Pull app bundle from S3 into a release dir on EFS ---
+            RELEASE="/mnt/efs/app/releases/${ReleaseId}"
+            mkdir -p "$RELEASE"
+            aws s3 cp "s3://${ArtifactBucket}/${AppCodeKey}" /tmp/app.zip --region "${AWS::Region}"
+            unzip -q -o /tmp/app.zip -d "$RELEASE"
+
+            # --- Permissions: apache (www-data) must be able to read the tree ---
+            chown -R www-data:www-data /mnt/efs/app
+            chmod o+x /mnt/efs /mnt/efs/app
+            chmod -R o+rX /mnt/efs/app
+
+            # --- Atomic symlink flip ---
+            ln -sfn "$RELEASE" /mnt/efs/app/current
+
+            # --- Sessions on EFS ---
+            mkdir -p /mnt/efs/sessions
+            chown www-data:www-data /mnt/efs/sessions
+            chmod 770 /mnt/efs/sessions
+
+            # --- Apache vhost (printf, no heredoc indentation traps) ---
+            printf '%s\n' \
+              '<VirtualHost *:80>' \
+              '    ServerAdmin webmaster@localhost' \
+              '    DocumentRoot /mnt/efs/app/current' \
+              '' \
+              '    <Directory /mnt/efs/app/current>' \
+              '        Options -Indexes +FollowSymLinks' \
+              '        AllowOverride All' \
+              '        Require all granted' \
+              '    </Directory>' \
+              '' \
+              '    ErrorLog /var/log/apache2/error.log' \
+              '    CustomLog /var/log/apache2/access.log combined' \
+              '</VirtualHost>' \
+              > /etc/apache2/sites-available/000-default.conf
+
+            # --- PHP env (Cognito + DB), also via printf ---
+            printf '%s\n' \
+              'SetEnv CC_DB_HOST ${Database.Endpoint.Address}' \
+              'SetEnv CC_DB_USER ${DBMasterUsername}' \
+              'SetEnv CC_DB_PASS ${DBMasterPassword}' \
+              'SetEnv CC_DB_NAME cloudcart' \
+              'SetEnv CC_COGNITO_REGION ${AWS::Region}' \
+              'SetEnv CC_COGNITO_USER_POOL ${UserPool}' \
+              'SetEnv CC_COGNITO_CLIENT_ID ${UserPoolClient}' \
+              > /etc/apache2/conf-available/cloudcart-env.conf
+
+            # --- Enable modules + conf, restart ---
+            a2enmod rewrite
+            a2enconf cloudcart-env
+            sed -i 's/index.html/index.php index.html/' /etc/apache2/mods-enabled/dir.conf
+
+            systemctl enable apache2
+            systemctl restart apache2
+            systemctl is-active --quiet apache2 || { echo "Apache failed to start"; exit 1; }
+
+            # --- Wait for RDS, apply schema ---
+            for i in $(seq 1 40); do
+              if mysqladmin ping -h "${Database.Endpoint.Address}" -u "${DBMasterUsername}" -p"${DBMasterPassword}" --connect-timeout=5; then
+                break
+              fi
+              echo "Waiting for RDS (attempt $i)..."
+              sleep 15
+            done
+
+            mysql -h "${Database.Endpoint.Address}" -u "${DBMasterUsername}" -p"${DBMasterPassword}" cloudcart < "$RELEASE/schema.sql"
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      MinSize: "2"
+      DesiredCapacity: "2"
+      MaxSize: "6"
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      TargetGroupARNs: [!Ref TargetGroup]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - {Key: Name, Value: CloudCart-EC2, PropagateAtLaunch: true}
+
+  CPUTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref ASGTargetCpuUtilization
+
+  # ---------------------------------------------------------------------------
+  # SNS + Lambda
+  # ---------------------------------------------------------------------------
+
+  UploadNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cloudcart-upload-notifications
+
+  UploadNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UploadNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  RecordWriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: lambda_record_writer.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaCodeKey
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateAppSubnetA
+          - !Ref PrivateAppSubnetB
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt Database.Endpoint.Address
+          DB_USER: !Ref DBMasterUsername
+          DB_PASS: !Ref DBMasterPassword
+          DB_NAME: cloudcart
+          SNS_TOPIC_ARN: !Ref UploadNotificationTopic
+
+# -----------------------------------------------------------------------------
+Outputs:
+# -----------------------------------------------------------------------------
+
+  LoadBalancerURL:
+    Description: Public URL of the CloudCart storefront
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  DatabaseEndpoint:
+    Description: RDS MySQL endpoint
+    Value: !GetAtt Database.Endpoint.Address
+
+  UploadsBucketName:
+    Description: S3 bucket for product image/document uploads
+    Value: !Ref UploadsBucket
+
+  SNSTopicArn:
+    Description: SNS topic for upload notifications
+    Value: !Ref UploadNotificationTopic
+
+  EFSFileSystemId:
+    Description: Shared EFS file system ID
+    Value: !Ref AppFileSystem
+
+  VpcId:
+    Description: CloudCart VPC ID
+    Value: !Ref VPC
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  CognitoClientId:
+    Description: Cognito app client ID
+    Value: !Ref UserPoolClient
